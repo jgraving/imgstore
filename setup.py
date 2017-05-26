@@ -49,7 +49,7 @@ setup(
     ],
     extras_require={
         'bloscpack': ['bloscpack'],
-        'pims': ['pims', 'av'],
+        'pims': ['av', 'imageio', 'slicerator'],  # 'pims'
     },
     entry_points={
         'console_scripts': [

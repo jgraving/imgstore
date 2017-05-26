@@ -13,8 +13,11 @@ dependencies:
   - bloscpack
 
   - opencv
-  - pims
+  # - pims
+  - slicerator
   - av
+  - ffmpeg
+  - imageio
 
   - ruamel.yaml
 

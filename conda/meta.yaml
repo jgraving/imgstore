@@ -27,7 +27,10 @@ requirements:
     - bloscpack
     - opencv
     - ruamel.yaml
-    - pims
+    # - pims
+    - slicerator
+    - imageio
+    - ffmpeg
     - av
 
 test:
