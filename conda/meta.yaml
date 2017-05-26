@@ -27,6 +27,7 @@ requirements:
     - bloscpack
     - opencv
     - ruamel.yaml
+    - pims
 
 test:
   requires:

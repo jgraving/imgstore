@@ -48,7 +48,8 @@ setup(
         'pytest-pep8'
     ],
     extras_require={
-        'bloscpack': ['bloscpack']
+        'bloscpack': ['bloscpack'],
+        'pims': ['pims', 'av'],
     },
     entry_points={
         'console_scripts': [
