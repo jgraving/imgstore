@@ -617,7 +617,7 @@ class VideoImgStore(_MetadataMixin, _ImgStore):
 
     _supported_modes = 'rw'
 
-    lossless = None
+    lossless = None  # FIXME: this will depend on the format
 
     def __init__(self, **kwargs):
 
