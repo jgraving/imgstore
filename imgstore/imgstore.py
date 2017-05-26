@@ -751,7 +751,7 @@ def new_for_filename(path, **kwargs):
 
 class VideoImgStoreAV(_MetadataMixin, _ImgStore):
 
-    _supported_modes = 'r'
+    _supported_modes = 'rw'
 
     lossless = None
 
@@ -762,6 +762,24 @@ class VideoImgStoreAV(_MetadataMixin, _ImgStore):
 
         # keep compat with VideoImgStoreFFMPEG
         kwargs.pop('seek', None)
+
+        fmt = kwargs.pop('format', None)
+        if kwargs['mode'] == 'w':
+            imgshape = kwargs['imgshape']
+
+            if 'chunksize' not in kwargs:
+                kwargs['chunksize'] = 500
+
+            if fmt != 'mjpeg':
+                raise ValueError('only mjpeg supported for writing')
+
+            self._codec = FourCC('M', 'J', 'P', 'G')
+            self._color = (imgshape[-1] == 3) & (len(imgshape) == 3)
+
+            metadata = kwargs.get('metadata', {})
+            metadata[STORE_MD_KEY] = {'format': 'mjpeg'}
+            kwargs['metadata'] = metadata
+            kwargs['encoding'] = kwargs.pop('encoding', None)
 
         _ImgStore.__init__(self, **kwargs)
 
@@ -781,11 +799,33 @@ class VideoImgStoreAV(_MetadataMixin, _ImgStore):
             chunk_numbers = list(map(int, map(operator.itemgetter(0), map(os.path.splitext, avis))))
         return list(zip(chunk_numbers, tuple(os.path.join(self._basedir, '%06d' % n) for n in chunk_numbers)))
 
+    def _close(self):
+        if self._cap is not None:
+            if not isinstance(self._cap, pims.FramesSequence):
+                self._cap.release()
+            else:
+                self._cap.close()
+        self._cap = None
+
     def _save_image(self, img, frame_number, frame_time):
-        raise NotImplementedError()
+        # we always write color because its more supported
+        frame = _ensure_color(img)
+        self._cap.write(frame)
+        if not os.path.isfile(self._capfn):
+            raise Exception('The opencv backend does not actually have write support')
+        self._save_image_metadata(frame_number, frame_time)
 
     def _save_chunk(self, old, new):
-        raise NotImplementedError()
+        if self._cap is not None:
+            self._close()
+            self._save_chunk_metadata(os.path.join(self._basedir, '%06d' % old))
+
+        if new is not None:
+            fn = os.path.join(self._basedir, '%06d%s' % (new, self._ext))
+            h, w = self._imgshape[:2]
+            self._cap = cv2.VideoWriter(fn, self._codec, 25, (w, h), isColor=True)
+            self._capfn = fn
+            self._new_chunk_metadata(os.path.join(self._basedir, '%06d' % new))
 
     def _load_image(self, idx):
         # only seek if we have to, otherwise take the fast path
@@ -802,15 +842,18 @@ class VideoImgStoreAV(_MetadataMixin, _ImgStore):
     def _load_chunk(self, n):
         fn = os.path.join(self._basedir, '%06d%s' % (n, self._ext))
         if fn != self._capfn:
-            if self._cap is not None:
-                self._cap.close()
+            # Close
+            self._close()
 
+            # Open for reading
             self._log.debug('loading chunk %s' % n)
             self._capfn = fn
-            # noinspection PyArgumentList
             self._cap = pims.open(fn)
 
+            # Load metadata
             self._load_chunk_metadata(os.path.join(self._basedir, '%06d' % n))
+
+            # Load index to frames in this chunk
             self._chunk_index = self._chunk_md['frame_number']
 
     @classmethod
