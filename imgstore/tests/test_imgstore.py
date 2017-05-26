@@ -384,6 +384,7 @@ def test_store_frame_metadata(request):
 
     d.close()
 
+
 def test_videoimgstore_mp4():
     L = 16
     SZ = 512
@@ -399,7 +400,7 @@ def test_videoimgstore_mp4():
         assert _frame_number == i
         assert decode_image(img, nbits=L, imgsize=SZ) == i
 
-    for i in (7,57,98,12,168):
+    for i in (7, 57, 98, 12, 168):
         img, (_frame_number, _frame_timestamp) = d.get_image(i)
         assert img.shape == (SZ, SZ)
         assert _frame_number == i
