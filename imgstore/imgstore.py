@@ -615,142 +615,6 @@ class DirectoryImgStore(_MetadataMixin, _ImgStore):
 
 class VideoImgStore(_MetadataMixin, _ImgStore):
 
-    _supported_modes = 'wr'
-
-    lossless = False  # fixme. depends on codec
-
-    def __init__(self, **kwargs):
-
-        self._cap = None
-        self._capfn = None
-
-        fmt = kwargs.pop('format', None)
-        # keep compat with VideoImgStoreFFMPEG
-        kwargs.pop('seek', None)
-
-        if kwargs['mode'] == 'w':
-            imgshape = kwargs['imgshape']
-
-            if 'chunksize' not in kwargs:
-                kwargs['chunksize'] = 500
-
-            if fmt != 'mjpeg':
-                raise ValueError('only mjpeg supported')
-
-            self._codec = FourCC('M', 'J', 'P', 'G')
-            self._color = (imgshape[-1] == 3) & (len(imgshape) == 3)
-
-            metadata = kwargs.get('metadata', {})
-            metadata[STORE_MD_KEY] = {'format': 'mjpeg'}
-            kwargs['metadata'] = metadata
-            kwargs['encoding'] = kwargs.pop('encoding', None)
-
-        _ImgStore.__init__(self, **kwargs)
-
-        if self._mode == 'r':
-            imgshape = self._metadata['imgshape']
-            self._color = (imgshape[-1] == 3) & (len(imgshape) == 3)
-
-    @property
-    def _ext(self):
-        if self._metadata['format'] == 'mjpeg':
-            return '.avi'
-        return '.mp4'
-
-    def _find_chunks(self, chunk_numbers):
-        if chunk_numbers is None:
-            avis = map(os.path.basename, glob.glob(os.path.join(self._basedir, '*%s' % self._ext)))
-            chunk_numbers = list(map(int, map(operator.itemgetter(0), map(os.path.splitext, avis))))
-        return list(zip(chunk_numbers, tuple(os.path.join(self._basedir, '%06d' % n) for n in chunk_numbers)))
-
-    def _save_image(self, img, frame_number, frame_time):
-        # we always write color because its more supported
-        frame = _ensure_color(img)
-        self._cap.write(frame)
-        if not os.path.isfile(self._capfn):
-            raise Exception('The opencv backend does not actually have write support')
-        self._save_image_metadata(frame_number, frame_time)
-
-    def _save_chunk(self, old, new):
-        if self._cap is not None:
-            self._cap.release()
-            self._save_chunk_metadata(os.path.join(self._basedir, '%06d' % old))
-
-        if new is not None:
-            fn = os.path.join(self._basedir, '%06d%s' % (new, self._ext))
-            h, w = self._imgshape[:2]
-            self._cap = cv2.VideoWriter(fn, self._codec, 25, (w, h), isColor=True)
-            self._capfn = fn
-            self._new_chunk_metadata(os.path.join(self._basedir, '%06d' % new))
-
-    def _load_image(self, idx):
-        # only seek if we have to, otherwise take the fast path
-        if (idx - self._frame_idx) != 1:
-            self._cap.set(getattr(cv2, "CAP_PROP_POS_FRAMES", 1), idx)
-
-        _, _img = self._cap.read()
-        if self._color:
-            # almost certainly no-op as opencv usually returns color frames....
-            img = _ensure_color(_img)
-        else:
-            img = _ensure_grayscale(_img)
-
-        return img, (self._chunk_md['frame_number'][idx], self._chunk_md['frame_time'][idx])
-
-    def _load_chunk(self, n):
-        fn = os.path.join(self._basedir, '%06d%s' % (n, self._ext))
-        if fn != self._capfn:
-            if self._cap is not None:
-                self._cap.release()
-
-            self._log.debug('loading chunk %s' % n)
-            self._capfn = fn
-            # noinspection PyArgumentList
-            self._cap = cv2.VideoCapture(self._capfn)
-
-            if not self._cap.isOpened():
-                raise Exception("OpenCV unable to open %s" % fn)
-
-            self._load_chunk_metadata(os.path.join(self._basedir, '%06d' % n))
-            self._chunk_index = self._chunk_md['frame_number']
-
-    @classmethod
-    def supported_formats(cls):
-        return ['mjpeg']
-
-    @classmethod
-    def supports_format(cls, fmt):
-        return fmt == 'mjpeg'
-
-
-def new_for_filename(path, **kwargs):
-    filename = os.path.basename(path)
-    if filename != STORE_MD_FILENAME:
-        raise ValueError('should be a path to a store %s file' % STORE_MD_FILENAME)
-
-    if 'mode' not in kwargs:
-        kwargs['mode'] = 'r'
-    if 'basedir' not in kwargs:
-        kwargs['basedir'] = os.path.dirname(path)
-
-    with open(path, 'rt') as f:
-        clsname = yaml.load(f, Loader=yaml.Loader)[STORE_MD_KEY]['class']
-
-    # retain compatibility with internal loopbio stores
-    if clsname == 'VideoImgStoreFFMPEG':
-        clsname = 'VideoImgStore'
-
-    try:
-        cls = {DirectoryImgStore.__name__: DirectoryImgStore,
-               VideoImgStore.__name__: VideoImgStore}[clsname]
-    except KeyError:
-        raise ValueError('store class %s not supported' % clsname)
-
-    return cls(**kwargs)
-
-
-class VideoImgStoreAV(_MetadataMixin, _ImgStore):
-
     _supported_modes = 'rw'
 
     lossless = None
@@ -880,11 +744,36 @@ def new_for_filename(path, **kwargs):
 
     # retain compatibility with internal loopbio stores
     if clsname == 'VideoImgStoreFFMPEG':
+        clsname = 'VideoImgStore'
+
+    try:
+        cls = {DirectoryImgStore.__name__: DirectoryImgStore,
+               VideoImgStore.__name__: VideoImgStore}[clsname]
+    except KeyError:
+        raise ValueError('store class %s not supported' % clsname)
+
+    return cls(**kwargs)
+
+
+def new_for_filename(path, **kwargs):
+    filename = os.path.basename(path)
+    if filename != STORE_MD_FILENAME:
+        raise ValueError('should be a path to a store %s file' % STORE_MD_FILENAME)
+
+    if 'mode' not in kwargs:
+        kwargs['mode'] = 'r'
+    if 'basedir' not in kwargs:
+        kwargs['basedir'] = os.path.dirname(path)
+
+    with open(path, 'rt') as f:
+        clsname = yaml.load(f, Loader=yaml.Loader)[STORE_MD_KEY]['class']
+
+    # retain compatibility with internal loopbio stores
+    if clsname == 'VideoImgStoreFFMPEG':
         clsname = 'VideoImgStoreAV'
 
     try:
         cls = {DirectoryImgStore.__name__: DirectoryImgStore,
-               VideoImgStoreAV.__name__: VideoImgStoreAV,
                VideoImgStore.__name__: VideoImgStore}[clsname]
     except KeyError:
         raise ValueError('store class %s not supported' % clsname)
@@ -893,7 +782,7 @@ def new_for_filename(path, **kwargs):
 
 
 def new_for_format(fmt, **kwargs):
-    for cls in (DirectoryImgStore, VideoImgStore, VideoImgStoreAV):
+    for cls in (DirectoryImgStore, VideoImgStore):
         if cls.supports_format(fmt):
             kwargs['format'] = fmt
             return cls(**kwargs)
@@ -902,6 +791,6 @@ def new_for_format(fmt, **kwargs):
 
 def get_supported_formats():
     f = []
-    for cls in (DirectoryImgStore, VideoImgStoreAV, VideoImgStore):
+    for cls in (DirectoryImgStore, VideoImgStore):
         f.extend(cls.supported_formats())
     return f
