@@ -712,7 +712,7 @@ class VideoImgStore(_MetadataMixin, _ImgStore):
             # Open for reading
             self._log.debug('loading chunk %s' % n)
             self._capfn = fn
-            self._cap = pims.PyAVVideoReader(fn, cache_size=16, fast_forward_thresh=32, stream_index=0)
+            self._cap = pims.open(fn)
 
             # Load metadata
             self._load_chunk_metadata(os.path.join(self._basedir, '%06d' % n))
