@@ -15,6 +15,8 @@ import json
 import numpy as np
 import pandas as pd
 
+import pims
+
 try:
     import bloscpack
 except ImportError:
@@ -747,8 +749,108 @@ def new_for_filename(path, **kwargs):
     return cls(**kwargs)
 
 
+class VideoImgStoreAV(_MetadataMixin, _ImgStore):
+
+    _supported_modes = 'r'
+
+    lossless = None
+
+    def __init__(self, **kwargs):
+
+        self._cap = None
+        self._capfn = None
+
+        # keep compat with VideoImgStoreFFMPEG
+        kwargs.pop('seek', None)
+
+        _ImgStore.__init__(self, **kwargs)
+
+        if self._mode == 'r':
+            imgshape = self._metadata['imgshape']
+            self._color = (imgshape[-1] == 3) & (len(imgshape) == 3)
+
+    @property
+    def _ext(self):
+        if self._metadata['format'] == 'mjpeg':
+            return '.avi'
+        return '.mp4'
+
+    def _find_chunks(self, chunk_numbers):
+        if chunk_numbers is None:
+            avis = map(os.path.basename, glob.glob(os.path.join(self._basedir, '*%s' % self._ext)))
+            chunk_numbers = list(map(int, map(operator.itemgetter(0), map(os.path.splitext, avis))))
+        return list(zip(chunk_numbers, tuple(os.path.join(self._basedir, '%06d' % n) for n in chunk_numbers)))
+
+    def _save_image(self, img, frame_number, frame_time):
+        raise NotImplementedError()
+
+    def _save_chunk(self, old, new):
+        raise NotImplementedError()
+
+    def _load_image(self, idx):
+        # only seek if we have to, otherwise take the fast path
+        _img = self._cap[idx][:, :, ::-1]  # RGB -> BGR
+
+        if self._color:
+            # almost certainly no-op as opencv usually returns color frames....
+            img = _ensure_color(_img)
+        else:
+            img = _ensure_grayscale(_img)
+
+        return img, (self._chunk_md['frame_number'][idx], self._chunk_md['frame_time'][idx])
+
+    def _load_chunk(self, n):
+        fn = os.path.join(self._basedir, '%06d%s' % (n, self._ext))
+        if fn != self._capfn:
+            if self._cap is not None:
+                self._cap.close()
+
+            self._log.debug('loading chunk %s' % n)
+            self._capfn = fn
+            # noinspection PyArgumentList
+            self._cap = pims.open(fn)
+
+            self._load_chunk_metadata(os.path.join(self._basedir, '%06d' % n))
+            self._chunk_index = self._chunk_md['frame_number']
+
+    @classmethod
+    def supported_formats(cls):
+        return ['mjpeg', 'mp4']  # And anything else we have ffmpeg to read; so depends on the current system
+
+    @classmethod
+    def supports_format(cls, fmt):
+        return fmt in ('mjpeg', 'mp4')
+
+
+def new_for_filename(path, **kwargs):
+    filename = os.path.basename(path)
+    if filename != STORE_MD_FILENAME:
+        raise ValueError('should be a path to a store %s file' % STORE_MD_FILENAME)
+
+    if 'mode' not in kwargs:
+        kwargs['mode'] = 'r'
+    if 'basedir' not in kwargs:
+        kwargs['basedir'] = os.path.dirname(path)
+
+    with open(path, 'rt') as f:
+        clsname = yaml.load(f, Loader=yaml.Loader)[STORE_MD_KEY]['class']
+
+    # retain compatibility with internal loopbio stores
+    if clsname == 'VideoImgStoreFFMPEG':
+        clsname = 'VideoImgStoreAV'
+
+    try:
+        cls = {DirectoryImgStore.__name__: DirectoryImgStore,
+               VideoImgStoreAV.__name__: VideoImgStoreAV,
+               VideoImgStore.__name__: VideoImgStore}[clsname]
+    except KeyError:
+        raise ValueError('store class %s not supported' % clsname)
+
+    return cls(**kwargs)
+
+
 def new_for_format(fmt, **kwargs):
-    for cls in (DirectoryImgStore, VideoImgStore):
+    for cls in (DirectoryImgStore, VideoImgStore, VideoImgStoreAV):
         if cls.supports_format(fmt):
             kwargs['format'] = fmt
             return cls(**kwargs)
@@ -757,6 +859,6 @@ def new_for_format(fmt, **kwargs):
 
 def get_supported_formats():
     f = []
-    for cls in (DirectoryImgStore, VideoImgStore):
+    for cls in (DirectoryImgStore, VideoImgStoreAV, VideoImgStore):
         f.extend(cls.supported_formats())
     return f
