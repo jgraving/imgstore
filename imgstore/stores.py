@@ -7,13 +7,17 @@ import time
 import logging
 import glob
 import uuid
-import string
+import json
+import datetime
+import re
 
 import cv2
 from ruamel import yaml
-import json
 import numpy as np
 import pandas as pd
+import pytz
+import tzlocal
+import dateutil.parser
 
 try:
     import bloscpack
@@ -56,12 +60,23 @@ def _ensure_color(img):
 
 STORE_MD_KEY = '__store'
 STORE_MD_FILENAME = 'metadata.yaml'
+STORE_LOCK_FILENAME = '.lock'
+
+_VERBOSE_DEBUG_GETS = False
+_VERBOSE_DEBUG_CHUNKS = False
+
+
+def _extract_store_metadata(full_path):
+    with open(full_path, 'r') as f:
+        allmd = yaml.load(f)
+    return allmd.pop(STORE_MD_KEY)
 
 
 class _ImgStore(object):
-
     _version = 2
     _supported_modes = ''
+
+    FRAME_MD = ('frame_number', 'frame_time')
 
     def __init__(self, basedir, mode, imgshape=None, imgdtype=None, chunksize=None, metadata=None,
                  encoding=None, write_encode_encoding=None):
@@ -88,13 +103,15 @@ class _ImgStore(object):
 
         self._tN = self._t0 = time.time()
 
+        self._created_utc = self._timezone_local = None
+
         self.frame_min = np.nan
         self.frame_max = np.nan
         self.frame_number = np.nan
         self.frame_count = 0
         self.frame_time = np.nan
 
-        self._log = logging.getLogger('imgstore')
+        self._log = logging.getLogger('loopb.imgstore')
 
         self._chunk_n = 0
         self._chunk_n_and_chunk_paths = ()
@@ -104,8 +121,6 @@ class _ImgStore(object):
         self._extra_data_fp = self._extra_data_fn = None
 
         if mode == 'w':
-            if None in (imgshape, imgdtype, chunksize):
-                raise ValueError('imgshape, imgdtype, chunksize must not be None')
             self._frame_n = 0
             self._init_write(imgshape, imgdtype, chunksize, metadata, encoding, write_encode_encoding)
         elif mode == 'r':
@@ -114,6 +129,8 @@ class _ImgStore(object):
             # e.g. (3,9) -> 5
             # means frames 3-9 are contained in chunk 5
             self._index = {}
+            # for lookup by global index we also maintain a list of the chunk lengths
+            self._index_chunklens = []  # [(chunk_n, chunk_len)]
             # the chunk index is a list of framenumbers, the index of the
             # framenumber is the position in the chunk
             self._chunk_index = []
@@ -126,33 +143,40 @@ class _ImgStore(object):
             self._build_index(self._chunk_n_and_chunk_paths)
 
             # reset to the start of the file and load the first chunk
-            self._frame_idx = -1
             self._load_chunk(0)
-            self.frame_number = self.frame_min
+            assert self._chunk_current_frame_idx == -1
+            assert self._chunk_n == 0
+            self.frame_number = np.nan  # we haven't read any frames yet
+
+            # note: frame_idx always refers to the frame_idx within the chunk
+            # whereas frame_index refers to the global frame_index from (0, frame_count]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def _init_read(self):
-        with open(os.path.join(self._basedir, STORE_MD_FILENAME), 'rt') as f:
-            allmd = yaml.load(f, Loader=yaml.Loader)
+        fullpath = os.path.join(self._basedir, STORE_MD_FILENAME)
+        with open(fullpath, 'r') as f:
+            allmd = yaml.load(f)
         smd = allmd.pop(STORE_MD_KEY)
 
         self._user_metadata.update(allmd)
 
-        if smd['class'] == 'VideoImgStoreFFMPEG':
-            store_class = 'VideoImgStore'
-        else:
-            store_class = smd['class']
-
         class_name = getattr(self, 'class_name', self.__class__.__name__)
-        if store_class != class_name:
+        if smd['class'] != class_name:
             raise ValueError('incompatible store')
         if smd['version'] != self._version:
             raise ValueError('incompatible store version')
 
         try:
+            # noinspection PyShadowingNames
             uuid = smd['uuid']
         except KeyError:
-            self._log.warn('source is missing uuid, generating a weak one from filename')
-            uuid = string.ljust(os.path.basename(self._basedir), 32, 'X')
+            # noinspection PyShadowingNames
+            uuid = None
         self._uuid = uuid
 
         self._imgshape = tuple(smd['imgshape'])
@@ -160,6 +184,50 @@ class _ImgStore(object):
         self._chunksize = int(smd['chunksize'])
         self._encoding = smd['encoding']
         self._metadata = smd
+
+        # synthesize a created_date from old format stores
+        if 'created_utc' not in smd:
+            self._log.info('old store detected. synthesizing created datetime / timezone')
+
+            dt = tz = None
+            # we don't know the local timezone, so assume it is local
+            if 'timezone' in allmd:
+                # noinspection PyBroadException
+                try:
+                    tz = pytz.timezone(allmd['timezone'])
+                except Exception:
+                    pass
+            if tz is None:
+                tz = tzlocal.get_localzone()
+
+            # first the filename
+            m = re.match(r"""(.*)(20[\d]{6}_\d{6}).*""", os.path.basename(self._basedir))
+            if m:
+                name, datestr = m.groups()
+                # ive always been careful to make the files named with the local time
+                time_tuple = time.strptime(datestr, '%Y%m%d_%H%M%S')
+                _dt = datetime.datetime(*(time_tuple[0:6]))
+                dt = tz.localize(_dt).astimezone(pytz.utc)
+
+            # then the modification time of the file
+            if dt is None:
+                # file modifications are local time
+                ts = os.path.getmtime(fullpath)
+                dt = datetime.datetime.fromtimestamp(ts, tz=tzlocal.get_localzone()).astimezone(pytz.utc)
+
+            self._created_utc = dt
+            self._timezone_local = tz
+        else:
+            # ensure that created_utc always has the pytz.utc timezone object because fuck you python
+            # and fuck you dateutil for having different UTC tz objects
+            # https://github.com/dateutil/dateutil/issues/131
+            _dt = dateutil.parser.parse(smd['created_utc'])
+            self._log.debug('parsed created_utc: %s (from %r)' % (_dt.isoformat(), _dt))
+            try:
+                self._created_utc = _dt.astimezone(pytz.utc)  # aware object can be in any timezone
+            except ValueError:  # naive
+                self._created_utc = _dt.replace(tzinfo=pytz.utc)  # d must be in UTC
+            self._timezone_local = pytz.timezone(smd['timezone_local'])
 
         # if encoding is unset, autoconvert is no-op
         self._codec_proc.set_default_code(self._encoding)
@@ -186,13 +254,21 @@ class _ImgStore(object):
         self._imgdtype = imgdtype
         self._chunksize = chunksize
 
+        self._uuid = uuid.uuid4().hex
+        # because fuck you python that utcnow is naieve. kind of fixed in python >3.2
+        self._created_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
+        self._timezone_local = tzlocal.get_localzone()
+
         store_md = {'imgshape': imgshape,
                     'imgdtype': self._imgdtype,
                     'chunksize': chunksize,
                     'class': self.__class__.__name__,
                     'version': self._version,
                     'encoding': encoding,
-                    'uuid': uuid.uuid4().hex}
+                    # actually write the string as naieve because we have guarenteed it is UTC
+                    'created_utc': self._created_utc.replace(tzinfo=None).isoformat(),
+                    'timezone_local': str(self._timezone_local),
+                    'uuid': self._uuid}
 
         if metadata is None:
             metadata[STORE_MD_KEY] = store_md
@@ -204,33 +280,180 @@ class _ImgStore(object):
         else:
             raise ValueError('metadata must be a dictionary')
 
-        with open(os.path.join(self._basedir, STORE_MD_FILENAME), 'wt') as f:
+        with open(os.path.join(self._basedir, STORE_MD_FILENAME), 'w') as f:
             yaml.safe_dump(metadata, f)
 
-        # noinspection PyUnresolvedReferences
+        with open(os.path.join(self._basedir, STORE_LOCK_FILENAME), 'a') as _:
+            pass
+
         smd = metadata.pop(STORE_MD_KEY)
         self._metadata = smd
         self._user_metadata.update(metadata)
 
         self._save_chunk(None, self._chunk_n)
 
-    def _save_image(self, img, frame_number, frame_time):
-        raise NotImplementedError
+    def _save_chunk_metadata(self, path_without_extension, extension='.npz'):
+        path = path_without_extension + extension
+        self._save_index(path, self._chunk_md)
 
-    def _save_chunk(self, old, new):
-        raise NotImplementedError
+        # also calculate the filename of the extra file to hold any data
+        if self._extra_data_fp is not None:
+            self._extra_data_fp.write(']')
+            self._extra_data_fp.close()
+            self._extra_data_fp = None
 
-    def _load_image(self, idx):
-        raise NotImplementedError
+    def _new_chunk_metadata(self, chunk_path):
+        self._extra_data_fn = chunk_path + '.extra.json'
+        self._chunk_md = {k: [] for k in _ImgStore.FRAME_MD}
+        self._chunk_md.update(self._metadata)
 
-    def _load_chunk(self, n):
-        raise NotImplementedError
+    def _save_image_metadata(self, frame_number, frame_time):
+        self._chunk_md['frame_number'].append(frame_number)
+        self._chunk_md['frame_time'].append(frame_time)
+
+    @staticmethod
+    def _save_index(path_with_extension, data_dict):
+        _, extension = os.path.splitext(path_with_extension)
+        if extension == '.yaml':
+            with open(path_with_extension, 'w') as f:
+                yaml.safe_dump(data_dict, f)
+        elif extension == '.npz':
+            with open(path_with_extension, 'wb') as f:
+                # noinspection PyTypeChecker
+                np.savez(f, **data_dict)
+        else:
+            raise ValueError('unknown index format: %s' % extension)
+
+    @staticmethod
+    def _remove_index(path_without_extension):
+        for extension in ('.npz', '.yaml'):
+            path = path_without_extension + extension
+            if os.path.exists(path):
+                os.unlink(path)
+
+    @staticmethod
+    def _load_index(path_without_extension):
+        for extension in ('.npz', '.yaml'):
+            path = path_without_extension + extension
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    if extension == '.yaml':
+                        dat = yaml.safe_load(f)
+                        return {k: dat[k] for k in _ImgStore.FRAME_MD}
+                    elif extension == '.npz':
+                        dat = np.load(f)
+                        return {k: dat[k].tolist() for k in _ImgStore.FRAME_MD}
+
+        raise IOError('could not find index %s' % path_without_extension)
 
     def _build_index(self, chunk_n_and_chunk_paths):
+        t0 = time.time()
+        for chunk_n, chunk_path in sorted(chunk_n_and_chunk_paths, key=operator.itemgetter(0)):
+            try:
+                idx = self._load_index(chunk_path)
+            except IOError:
+                self._log.warning('missing index for chunk %s' % chunk_n)
+                continue
+
+            if not idx['frame_number']:
+                # empty chunk
+                continue
+
+            chunk_len = len(idx['frame_number'])
+            self.frame_count += chunk_len
+            self._t0 = min(self._t0, np.min(idx['frame_time']))
+            self._tN = max(self._tN, np.max(idx['frame_time']))
+
+            for frame_range in _extract_ranges(idx['frame_number']):
+                self._index[frame_range] = chunk_n
+                if _VERBOSE_DEBUG_CHUNKS:
+                    self._log.debug('index:framenumbers chunk: %d holds:%r' % (chunk_n, frame_range))
+            self._index_chunklens.append((chunk_n, chunk_len))
+
+        if _VERBOSE_DEBUG_CHUNKS:
+            _chunk_range = xrange(0, -2, -1)
+            for _chunk_n, _chunk_len in self._index_chunklens:
+                _chunk_range = xrange(_chunk_range[-1] + 1, _chunk_range[-1] + 1 + _chunk_len)
+                self._log.debug('index:index chunk: %d holds:%r' % (_chunk_n, list(_chunk_range)))
+
+        self._log.debug('built index in %fs' % (time.time() - t0))
+
+        k = self._index.keys()
+        self.frame_min = np.min(k)
+        self.frame_max = np.max(k)
+
+        self._log.debug('frame range %f -> %f' % (self.frame_min, self.frame_max))
+
+    def _load_chunk_metadata(self, path_without_extension):
+        self._chunk_md = self._load_index(path_without_extension)
+
+    def get_frame_metadata(self):
+        dat = {k: [] for k in _ImgStore.FRAME_MD}
+        for chunk_n, chunk_path in self._find_chunks(self.chunks):
+            idx = self._load_index(chunk_path)
+            for k in _ImgStore.FRAME_MD:
+                dat[k].extend(idx[k])
+        return dat
+
+    @property
+    def has_extra_data(self):
+        for chunk_n, chunk_path in self._chunk_n_and_chunk_paths:
+            path = chunk_path + '.extra.json'
+            if os.path.exists(path):
+                return True
+        return False
+
+    def get_extra_data(self):
+        dfs = []
+        for chunk_n, chunk_path in self._chunk_n_and_chunk_paths:
+            path = chunk_path + '.extra.json'
+            if os.path.exists(path):
+                dfs.append(pd.read_json(path, orient='record'))
+        return pd.concat(dfs, axis=0, ignore_index=True)
+
+    def add_extra_data(self, **data):
+        if not data:
+            return
+
+        data['frame_time'] = self.frame_time
+        data['frame_number'] = self.frame_number
+        data['frame_index'] = self._frame_n - 1  # we post-increment in add_frame
+
+        # noinspection PyBroadException
+        try:
+            txt = json.dumps(data, cls=JsonCustomEncoder)
+        except Exception:
+            self._log.warning('error writing extra data', exc_info=True)
+            return
+
+        if self._extra_data_fp is None:
+            self._extra_data_fp = open(self._extra_data_fn, 'w')
+            self._extra_data_fp.write('[')
+        else:
+            self._extra_data_fp.write(', ')
+        self._extra_data_fp.write(txt)
+
+    def _save_image(self, img, frame_number, frame_time):  # pragma: no cover
         raise NotImplementedError
 
-    def _find_chunks(self, chunk_numbers):
+    def _save_chunk(self, old, new):  # pragma: no cover
         raise NotImplementedError
+
+    def _load_image(self, idx):  # pragma: no cover
+        raise NotImplementedError
+
+    def _load_chunk(self, n):  # pragma: no cover
+        raise NotImplementedError
+
+    def _find_chunks(self, chunk_numbers):  # pragma: no cover
+        raise NotImplementedError
+
+    def __len__(self):
+        return self.frame_count
+
+    @property
+    def created(self):
+        return self._created_utc, self._timezone_local
 
     @property
     def uuid(self):
@@ -238,7 +461,7 @@ class _ImgStore(object):
 
     @property
     def chunks(self):
-        return sorted(set(self._index.values()))
+        return np.unique(self._index.values()).tolist()
 
     @property
     def user_metadata(self):
@@ -247,6 +470,10 @@ class _ImgStore(object):
     @property
     def filename(self):
         return self._basedir
+
+    @property
+    def full_path(self):
+        return os.path.join(self._basedir, STORE_MD_FILENAME)
 
     @property
     def image_shape(self):
@@ -260,19 +487,30 @@ class _ImgStore(object):
     def duration(self):
         return self._tN - self._t0
 
-    @property
-    def full_path(self):
-        return os.path.join(self._basedir, STORE_MD_FILENAME)
+    @staticmethod
+    def _extract_only_frame(basedir, chunk_n, frame_n, smd):
+        raise NotImplementedError
+
+    @classmethod
+    def extract_only_frame(cls, full_path, frame_index, _smd=None):
+        if _smd is None:
+            smd = _extract_store_metadata(full_path)
+        else:
+            smd = _smd
+
+        chunksize = int(smd['chunksize'])
+
+        # go directly to the chunk
+        chunk_n = frame_index // chunksize
+        frame_n = frame_index % chunksize
+
+        return cls._extract_only_frame(basedir=os.path.dirname(full_path),
+                                       chunk_n=chunk_n,
+                                       frame_n=frame_n,
+                                       smd=smd)
 
     def disable_decoding(self):
         self._decode_image = lambda x: x
-
-    def add_extra_data(self, **data):
-        pass
-
-    # noinspection PyMethodMayBeStatic
-    def get_extra_data(self):
-        return {}
 
     def add_image(self, img, frame_number, frame_time):
         self._save_image(self._encode_image(img), frame_number, frame_time)
@@ -283,8 +521,8 @@ class _ImgStore(object):
         self.frame_time = frame_time
 
         if self._frame_n == 0:
-            self._t0 = time.time()
-        self._tN = time.time()
+            self._t0 = frame_time
+        self._tN = frame_time
 
         self._frame_n += 1
         if (self._frame_n % self._chunksize) == 0:
@@ -295,19 +533,16 @@ class _ImgStore(object):
 
         self.frame_count = self._frame_n
 
-    def _get_next_framenumber_and_idx(self):
+    def _get_next_framenumber_and_chunk_frame_idx(self):
         if self.frame_number == self.frame_max:
             raise EOFError
 
-        idx = self._frame_idx + 1
+        idx = self._chunk_current_frame_idx + 1
         try:
             frame_number = self._chunk_index[idx]
         except IndexError:
             # open the next chunk
-            chunk_n = self._chunk_n + 1
-            self._frame_idx = -1
-            self._load_chunk(chunk_n)
-            self._chunk_n = chunk_n
+            self._load_chunk(self._chunk_n + 1)
             # first frame is start of chunk
             idx = 0
             frame_number = self._chunk_index[idx]
@@ -315,15 +550,60 @@ class _ImgStore(object):
         return frame_number, idx
 
     def get_next_framenumber(self):
-        return self._get_next_framenumber_and_idx()[0]
+        return self._get_next_framenumber_and_chunk_frame_idx()[0]
 
     def get_next_image(self):
-        frame_number, idx = self._get_next_framenumber_and_idx()
-        return self.get_image(frame_number, exact_only=True, frame_idx=idx)
+        frame_number, idx = self._get_next_framenumber_and_chunk_frame_idx()
+        if _VERBOSE_DEBUG_GETS:
+            self._log.debug('get_next_image frame_number: %s idx %s' % (frame_number, idx))
+        return self._get_image_by_frame_number(frame_number, exact_only=True, frame_idx=idx)
 
-    def get_image(self, frame_number, exact_only=True, frame_idx=None):
+    def _get_image_by_frame_index(self, frame_index):
+        """
+        return the frame at the following index in the store
+        """
+        if frame_index < 0:
+            raise ValueError('seeking to negative index not supported')
+
+        if _VERBOSE_DEBUG_CHUNKS:
+            self._log.debug('seek by frame_index %s' % frame_index)
+
+        # go through the global index and find where our index is
+        chunk_n = frame_idx = -1
+
+        _chunk_range = xrange(0, -2, -1)
+        for _chunk_n, _chunk_len in self._index_chunklens:
+            _chunk_range = xrange(_chunk_range[-1] + 1, _chunk_range[-1] + 1 + _chunk_len)
+            if frame_index in _chunk_range:
+                chunk_n = _chunk_n
+                # make chunk relative
+                frame_idx = frame_index - _chunk_range[0]
+                break
+
+        if chunk_n == -1:
+            raise ValueError('frame_index %s not found in index' % frame_idx)
+
+        # reset to start of chunk for load_image
+        self._load_chunk(chunk_n)
+
+        self._log.debug('seek found in chunk %d attempt read chunk index %d' % (self._chunk_n, frame_idx))
+
+        # ensure the read works before setting frame_number
+        _img, (_frame_number, _frame_timestamp) = self._load_image(frame_idx)
+        img = self._decode_image(_img)
+
+        self._chunk_current_frame_idx = frame_idx
+        self.frame_number = _frame_number
+
+        return img, (_frame_number, _frame_timestamp)
+
+    def _get_image_by_frame_number(self, frame_number, exact_only, frame_idx):
         # there is a high likelihood the current chunk holds the next frame
         # so look there first
+
+        if _VERBOSE_DEBUG_CHUNKS:
+            self._log.debug('seek by frame_number %s (exact: %s) frame_idx %s' % (frame_number, exact_only, frame_idx))
+
         if frame_idx is None:
             try:
                 frame_idx = self._chunk_index.index(frame_number)
@@ -333,7 +613,7 @@ class _ImgStore(object):
         if frame_idx is None:
             chunk_n = -1
             found = False
-            for fn_range, chunk_n in self._index.items():
+            for fn_range, chunk_n in self._index.iteritems():
                 if (frame_number >= fn_range[0]) and (frame_number <= fn_range[1]):
                     found = True
                     break
@@ -343,8 +623,8 @@ class _ImgStore(object):
                     raise ValueError('frame #%s not found in any chunk' % frame_number)
                 else:
                     # iterate the index again! and find the nearest frame
-                    fns = np.array(list(self._index.keys())).flatten()
-                    chunks = list(self._index.values())
+                    fns = np.array(self._index.keys()).flatten()
+                    chunks = self._index.values()
 
                     # find distance between desired frame, and the nearest chunk range
                     diffs = np.abs(fns - frame_number)
@@ -356,35 +636,79 @@ class _ImgStore(object):
                     orig_frame_number = frame_number
 
                     # the closest chunk
-                    # noinspection PyTypeChecker
                     chunk_n = chunks[_chunk_idx]
                     frame_number = fns[_fn_index]
                     self._log.debug("closest frame to %s is %s (chunk %s)" % (orig_frame_number, frame_number, chunk_n))
 
-            self._frame_idx = -1
             self._load_chunk(chunk_n)
-            self._chunk_n = chunk_n
             try:
                 frame_idx = self._chunk_index.index(frame_number)
             except ValueError:
                 raise ValueError('%s %s not found in chunk %s' % ('frame_number', frame_number, chunk_n))
 
+        if _VERBOSE_DEBUG_CHUNKS:
+            self._log.debug('seek found in chunk %d attempt read chunk index %d' % (self._chunk_n, frame_idx))
+
         # ensure the read works before setting frame_number
         _img, (_frame_number, _frame_timestamp) = self._load_image(frame_idx)
         img = self._decode_image(_img)
 
-        self._frame_idx = frame_idx
-        self.frame_number = frame_number
+        self._chunk_current_frame_idx = frame_idx
+        self.frame_number = _frame_number
 
         return img, (_frame_number, _frame_timestamp)
+
+    def get_image(self, frame_number, exact_only=True, frame_index=None):
+        """
+        seek to the supplied frame_number or frame_index. If frame_index is supplied get that image,
+        otherwise get the image corresponding to frame_number
+
+        :param frame_number:  (frame_min, frame_max)
+        :param exact_only: If False return the nearest frame
+        :param frame_index: frame_index (0, frame_count]
+        """
+        if _VERBOSE_DEBUG_GETS:
+            self._log.debug('get_image %s (exact: %s) frame_idx %s' % (frame_number, exact_only, frame_index))
+        if frame_index is not None:
+            return self._get_image_by_frame_index(frame_index)
+        else:
+            return self._get_image_by_frame_number(frame_number, exact_only=exact_only, frame_idx=None)
 
     def close(self):
         if self._mode in 'wa':
             self._save_chunk(self._chunk_n, None)
+            # noinspection PyBroadException
+            try:
+                if os.path.isfile(os.path.join(self._basedir, STORE_LOCK_FILENAME)):
+                    os.remove(os.path.join(self._basedir, STORE_LOCK_FILENAME))
+            except OSError:
+                self._log.warn('could not remove lock file', exc_info=True)
+            except Exception:
+                self._log.warn('could not remove lock file (unknown error)', exc_info=True)
 
-    # noinspection PyMethodMayBeStatic
-    def get_frame_metadata(self):
-        return {}
+    def empty(self):
+        if self._mode != 'w':
+            raise ValueError('can only empty stores for writing')
+
+        self.close()
+
+        self._tN = self._t0 = time.time()
+
+        self.frame_min = np.nan
+        self.frame_max = np.nan
+        self.frame_number = np.nan
+        self.frame_count = 0
+        self.frame_time = np.nan
+
+        self._chunk_n = 0
+        self._chunk_n_and_chunk_paths = ()
+
+        if self._extra_data_fp is not None:
+            self._extra_data_fp.close()
+            os.unlink(self._extra_data_fn)
+            self._extra_data_fp = self._extra_data_fn = None
+
+        self._frame_n = 0
 
     def reindex(self):
         """ modifies the current imgstore so that all framenumbers before frame_number=0 are negative
@@ -407,9 +731,9 @@ class _ImgStore(object):
         fn_new[:zero_idx] = range(-zero_idx, 0)
 
         for chunk_n, chunk_path in sorted(self._find_chunks(chunk_numbers=None), key=operator.itemgetter(0)):
-            # noinspection PyUnresolvedReferences
             ind = self._load_index(chunk_path)
 
+            # one would think using
             ofn = ind['frame_number'][:]
             nfn = fn_new[chunk_n*self._chunksize:(chunk_n*self._chunksize) + self._chunksize]
             assert len(ofn) == len(nfn)
@@ -418,7 +742,6 @@ class _ImgStore(object):
                        'frame_number': nfn,
                        '_frame_number_before_reindex': ofn}
 
-            # noinspection PyUnresolvedReferences
             self._remove_index(chunk_path)
             self._save_index(chunk_path + '.npz', new_ind)
 
@@ -432,8 +755,6 @@ class _ImgStore(object):
                 # noinspection PyBroadException
                 try:
                     df = pd.DataFrame(ed)
-                    if 'frame_index' not in df.columns:
-                        raise ValueError('can not reindex extra-data on old format stores')
                     df['_frame_number_before_reindex'] = df['frame_number']
                     df['frame_number'] = df.apply(lambda r: fn_new[int(r.frame_index)], axis=1)
                     with open(ed_path, 'w') as f:
@@ -441,131 +762,6 @@ class _ImgStore(object):
                     self._log.debug('reindexed chunk %d metadata (%s)' % (chunk_n, ed_path))
                 except Exception:
                     self._log.error('could not update chunk extra data to new framenumber', exc_info=True)
-
-
-# noinspection PyUnresolvedReferences,PyAttributeOutsideInit,PyClassHasNoInit
-class _MetadataMixin:
-
-    FRAME_MD = ('frame_number', 'frame_time')
-
-    def _save_index(self, path_with_extension, data_dict):
-        _, extension = os.path.splitext(path_with_extension)
-        if extension == '.yaml':
-            with open(path_with_extension, 'w') as f:
-                yaml.safe_dump(data_dict, f)
-        elif extension == '.npz':
-            with open(path_with_extension, 'wb') as f:
-                # noinspection PyTypeChecker
-                np.savez(f, **data_dict)
-        else:
-            raise ValueError('unknown index format: %s' % extension)
-
-    def _save_chunk_metadata(self, path_without_extension, extension='.npz'):
-        path = path_without_extension + extension
-        self._save_index(path, self._chunk_md)
-
-        # also calculate the filename of the extra file to hold any data
-        if self._extra_data_fp is not None:
-            self._extra_data_fp.write(']')
-            self._extra_data_fp.close()
-            self._extra_data_fp = None
-
-    def _new_chunk_metadata(self, chunk_path):
-        self._extra_data_fn = chunk_path + '.extra.json'
-        self._chunk_md = {k: [] for k in _MetadataMixin.FRAME_MD}
-        self._chunk_md.update(self._metadata)
-
-    def _save_image_metadata(self, frame_number, frame_time):
-        self._chunk_md['frame_number'].append(frame_number)
-        self._chunk_md['frame_time'].append(frame_time)
-
-    def add_extra_data(self, **data):
-        if not data:
-            return
-
-        data['frame_time'] = self.frame_time
-        data['frame_number'] = self.frame_number
-
-        # noinspection PyBroadException
-        try:
-            txt = json.dumps(data, cls=JsonCustomEncoder)
-        except:
-            self._log.warning('error writing extra data', exc_info=True)
-            return
-
-        if self._extra_data_fp is None:
-            self._extra_data_fp = open(self._extra_data_fn, 'wt')
-            self._extra_data_fp.write('[')
-        else:
-            self._extra_data_fp.write(', ')
-        self._extra_data_fp.write(txt)
-
-    # noinspection PyMethodMayBeStatic
-    def _remove_index(self, path_without_extension):
-        for extension in ('.npz', '.yaml'):
-            path = path_without_extension + extension
-            if os.path.exists(path):
-                os.unlink(path)
-
-    # noinspection PyMethodMayBeStatic
-    def _load_index(self, path_without_extension):
-        for extension in ('.npz', '.yaml'):
-            path = path_without_extension + extension
-            if os.path.exists(path):
-                if extension == '.yaml':
-                    with open(path, 'rt') as f:
-                        dat = yaml.safe_load(f)
-                        return {k: dat[k] for k in _MetadataMixin.FRAME_MD}
-                elif extension == '.npz':
-                    dat = np.load(path)
-                    return {k: dat[k].tolist() for k in _MetadataMixin.FRAME_MD}
-
-        raise IOError('could not find index %s' % path_without_extension)
-
-    def _build_index(self, chunk_n_and_chunk_paths):
-        t0 = time.time()
-        for chunk_n, chunk_path in chunk_n_and_chunk_paths:
-
-            try:
-                idx = self._load_index(chunk_path)
-            except IOError:
-                self._log.warning('missing index for chunk %s' % chunk_n)
-                continue
-
-            if not idx['frame_number']:
-                # empty chunk
-                continue
-
-            self.frame_count += len(idx['frame_number'])
-
-            for frame_range in _extract_ranges(idx['frame_number']):
-                self._index[frame_range] = chunk_n
-
-        self._log.debug('built index in %fs' % (time.time() - t0))
-
-        self.frame_min = np.nan if 0 == len(self._index) else min(low for low, _ in self._index)
-        self.frame_max = np.nan if 0 == len(self._index) else max(high for _, high in self._index)
-
-        self._log.debug('frame range %f -> %f' % (self.frame_min, self.frame_max))
-
-    def _load_chunk_metadata(self, path_without_extension):
-        self._chunk_md = self._load_index(path_without_extension)
-
-    def get_frame_metadata(self):
-        dat = {k: [] for k in _MetadataMixin.FRAME_MD}
-        for chunk_n, chunk_path in self._find_chunks(self.chunks):
-            idx = self._load_index(chunk_path)
-            for k in _MetadataMixin.FRAME_MD:
-                dat[k].extend(idx[k])
-        return dat
-
-    def get_extra_data(self):
-        dfs = []
-        for chunk_n, chunk_path in self._chunk_n_and_chunk_paths:
-            path = chunk_path + '.extra.json'
-            if os.path.exists(path):
-                dfs.append(pd.read_json(path, orient='record'))
-        return pd.concat(dfs, axis=0, ignore_index=True)
 
 
 def _extract_ranges(data):
@@ -583,8 +779,7 @@ def _extract_ranges(data):
     return ranges
 
 
-class DirectoryImgStore(_MetadataMixin, _ImgStore):
-
+class DirectoryImgStore(_ImgStore):
     _supported_modes = 'wr'
 
     _cv2_fmts = {'tif', 'png', 'jpg', 'ppm', 'pgm', 'pbm', 'bmp'}
@@ -595,13 +790,15 @@ class DirectoryImgStore(_MetadataMixin, _ImgStore):
         self._chunk_cdir = ''
         self._chunk_md = {}
 
+        # keep compat with VideoImgStore
+        kwargs.pop('videosize', None)
         # keep compat with VideoImgStoreFFMPEG
         kwargs.pop('seek', None)
 
+        self._format = kwargs.pop('format', None)
         if kwargs['mode'] == 'w':
-            if 'chunksize' not in kwargs:
-                kwargs['chunksize'] = 100
-            self._format = kwargs.pop('format')
+            if self._format is None:
+                raise ValueError('image format must be supplied')
             metadata = kwargs.get('metadata', {})
             metadata[STORE_MD_KEY] = {'format': self._format}
             kwargs['metadata'] = metadata
@@ -648,23 +845,26 @@ class DirectoryImgStore(_MetadataMixin, _ImgStore):
     def _find_chunks(self, chunk_numbers):
         if chunk_numbers is None:
             immediate_dirs = next(os.walk(self._basedir))[1]
-            chunk_numbers = list(map(int, immediate_dirs))  # N.B. need list, as we iterate it twice
-        return list(zip(chunk_numbers, tuple(os.path.join(self._basedir, '%06d' % int(n), 'index')
-                                             for n in chunk_numbers)))
+            chunk_numbers = map(int, immediate_dirs)
+        return zip(chunk_numbers, tuple(os.path.join(self._basedir, '%06d' % n, 'index') for n in chunk_numbers))
+
+    # noinspection PyShadowingBuiltins
+    @staticmethod
+    def _open_image(path, format, color):
+        if format in DirectoryImgStore._cv2_fmts:
+            flags = cv2.IMREAD_COLOR if color else cv2.IMREAD_GRAYSCALE
+            img = cv2.imread(path, flags)
+        elif format == 'npy':
+            img = np.load(path)
+        elif format == 'bpk':
+            img = bloscpack.unpack_ndarray_file(path)
+        else:
+            raise ValueError('unknown format')
+        return img
 
     def _load_image(self, idx):
         path = os.path.join(self._chunk_cdir, '%06d.%s' % (idx, self._format))
-        if self._format in self._cv2_fmts:
-            flags = cv2.IMREAD_COLOR if self._color else cv2.IMREAD_GRAYSCALE
-            img = cv2.imread(path, flags)
-        elif self._format == 'npy':
-            img = np.load(path)
-        elif self._format == 'bpk':
-            with open(path, 'rb') as reader:
-                img = bloscpack.numpy_io.unpack_ndarray(bloscpack.file_io.CompressedFPSource(reader))
-        else:
-            # Won't get here unless we relax checks in constructor, but better safe
-            raise ValueError('unknown format %s' % self._format)
+        img = self._open_image(path, self._format, self._color)
         return img, (self._chunk_md['frame_number'][idx], self._chunk_md['frame_time'][idx])
 
     def _load_chunk(self, n):
@@ -675,9 +875,19 @@ class DirectoryImgStore(_MetadataMixin, _ImgStore):
             self._load_chunk_metadata(os.path.join(self._chunk_cdir, 'index'))
             self._chunk_index = self._chunk_md['frame_number']
 
-    @classmethod
-    def supported_formats(cls):
-        return list(cls._cv2_fmts) + list(cls._raw_fmts)
+        self._chunk_n = n
+        self._chunk_current_frame_idx = -1  # not used in DirectoryImgStore, but maintain compat
+
+    @staticmethod
+    def _extract_only_frame(basedir, chunk_n, frame_n, smd):
+        fmt = smd['format']
+        cdir = os.path.join(basedir, '%06d' % chunk_n)
+        path = os.path.join(cdir, '%06d.%s' % (frame_n, fmt))
+
+        imgshape = tuple(smd['imgshape'])
+        color = (imgshape[-1] == 3) & (len(imgshape) == 3)
+
+        return DirectoryImgStore._open_image(path, fmt, color)
 
     @classmethod
     def supports_format(cls, fmt):
@@ -688,7 +898,7 @@ class DirectoryImgStore(_MetadataMixin, _ImgStore):
         return self._format != 'jpg'
 
 
-class VideoImgStore(_MetadataMixin, _ImgStore):
+class VideoImgStore(_ImgStore):
 
     _supported_modes = 'wr'
 
